@@ -10,7 +10,7 @@
     "seed": 1337,
     "iterations": 20000,
     "train_log_every": 50,
-    "max_wallclock_seconds": 600.0,
+    "max_wallclock_seconds": 0.0,
     "train_batch_tokens": 32768,
     "train_seq_len": 512,
     "val_eval_tokens": 524288,
@@ -47,19 +47,20 @@
     "swa_every": 50,
     "zstd_level": 22,
     "compile_training": true,
-    "compile_backend": "aot_eager"
+    "compile_backend": "inductor",
+    "neural_cache_enabled": false
   },
   "schedule": {
     "iterations_target": 20000,
-    "steps_completed": 674,
+    "steps_completed": 20000,
     "ternary_qat_start_frac": 0.85,
     "ternary_enable_step": 17000,
     "ternary_lr_scale_on_enable": 0.5,
-    "ternary_layers_enabled": 0,
+    "ternary_layers_enabled": 14,
     "swa_start_frac": 0.4,
     "swa_start_step": 8000,
     "swa_every": 50,
-    "swa_count": 0
+    "swa_count": 241
   },
   "architecture": {
     "model_dim": 512,
@@ -78,19 +79,47 @@
   },
   "metrics": {
     "pre_quant": {
-      "val_loss": 3.128829834909768,
-      "val_bpb": 1.8829695008251355
+      "val_loss": 4.1614444567889795,
+      "val_bpb": 2.504410084589164
     },
     "post_quant": {
-      "val_loss": 3.131576991852301,
-      "val_bpb": 1.8846227747357378
+      "val_loss": 2.5502748618283397,
+      "val_bpb": 1.5347877759169628
     },
     "post_neural_cache": {
-      "val_loss": 3.4316884292500967,
-      "val_bpb": 2.0543324433838395,
+      "val_loss": 2.6103576968056847,
+      "val_bpb": 1.5626542490503643,
       "windows": 1005,
-      "scored_tokens": 81423
+      "scored_tokens": 81423,
+      "effective_cache_max_tokens": 0,
+      "use_cache": 0
     },
-    "artifact_size_bytes": 12281675
+    "neural_cache_sweep": {
+      "0": {
+        "use_cache": 0,
+        "effective_cache_max_tokens": 0,
+        "val_loss": 2.6103576968056847,
+        "val_bpb": 1.5626542490503643,
+        "windows": 1005,
+        "scored_tokens": 81423
+      },
+      "256": {
+        "use_cache": 0,
+        "effective_cache_max_tokens": 0,
+        "val_loss": 2.6103576968056847,
+        "val_bpb": 1.5626542490503643,
+        "windows": 1005,
+        "scored_tokens": 81423
+      },
+      "1024": {
+        "use_cache": 0,
+        "effective_cache_max_tokens": 0,
+        "val_loss": 2.6103576968056847,
+        "val_bpb": 1.5626542490503643,
+        "windows": 1005,
+        "scored_tokens": 81423
+      }
+    },
+    "artifact_size_bytes": 12372468
   }
 }
