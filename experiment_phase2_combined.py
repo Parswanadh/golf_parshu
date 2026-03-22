@@ -15,6 +15,7 @@ import sentencepiece as spm
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 try:
     import zstandard as zstd
@@ -53,7 +54,7 @@ class Hyperparameters:
     iterations: int = int(os.environ.get("ITERATIONS", "20000"))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", "50"))
 
-    max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", "600"))
+    max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", "0"))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", "524288"))
     train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", "2048"))
 
@@ -99,7 +100,7 @@ class Hyperparameters:
     zstd_level: int = int(os.environ.get("ZSTD_LEVEL", "22"))
 
     compile_training: bool = bool(int(os.environ.get("COMPILE_TRAIN_MODEL", "1")))
-    compile_backend: str = os.environ.get("TORCH_COMPILE_BACKEND", "aot_eager")
+    compile_backend: str = os.environ.get("TORCH_COMPILE_BACKEND", "inductor")
 
     @property
     def total_depth(self) -> int:
@@ -388,11 +389,21 @@ class CausalSelfAttention(nn.Module):
         else:
             prev_k, prev_v = kv_cache
             cache_len = prev_k.size(2)
-            full_k = torch.cat((prev_k.to(dtype=k.dtype), k), dim=2)
-            full_v = torch.cat((prev_v.to(dtype=v.dtype), v), dim=2)
+            prev_k = prev_k.to(dtype=k.dtype)
+            prev_v = prev_v.to(dtype=v.dtype)
+            # Cache order must be past-before-present for causal decoding.
+            full_k = torch.cat((prev_k, k), dim=2)
+            full_v = torch.cat((prev_v, v), dim=2)
+            if cache_len > 0:
+                if not torch.equal(full_k[:, :, :1, :], prev_k[:, :, :1, :]):
+                    raise RuntimeError("Invalid cache concatenation order for K (expected cached before current).")
+                if not torch.equal(full_v[:, :, :1, :], prev_v[:, :, :1, :]):
+                    raise RuntimeError("Invalid cache concatenation order for V (expected cached before current).")
             full_k_exp = self._expand_kv_for_gqa(full_k)
             full_v_exp = self._expand_kv_for_gqa(full_v)
             mask = self.build_causal_mask(seqlen, cache_len, x.device)
+            if cache_len > 0 and not bool(mask[:, :cache_len].all().item()):
+                raise RuntimeError("Cached tokens are masked out; cached prefix must be fully visible.")
             attn_scores = torch.matmul(q, full_k_exp.transpose(-2, -1)) * self.scale
             attn_scores = attn_scores.masked_fill(~mask[None, None, :, :], torch.finfo(attn_scores.dtype).min)
             attn = torch.softmax(attn_scores, dim=-1)
@@ -496,14 +507,26 @@ def run_unet_once(
     skip_weights: Tensor,
     kv_cache_blocks: list[tuple[Tensor, Tensor] | None] | None = None,
     cache_max_tokens: int | None = None,
+    use_gradient_checkpointing: bool = False,
 ) -> tuple[Tensor, list[tuple[Tensor, Tensor] | None] | None]:
     if kv_cache_blocks is not None and len(kv_cache_blocks) != len(blocks):
         raise ValueError(f"kv_cache_blocks length {len(kv_cache_blocks)} does not match blocks length {len(blocks)}")
+    use_ckpt = use_gradient_checkpointing and torch.is_grad_enabled() and cache_max_tokens is None and kv_cache_blocks is None
     skips: list[Tensor] = []
     new_cache: list[tuple[Tensor, Tensor] | None] | None = [] if cache_max_tokens is not None else None
     for i in range(num_encoder_layers):
-        layer_cache = None if kv_cache_blocks is None else kv_cache_blocks[i]
-        x, layer_new_cache = blocks[i](x, x0, kv_cache=layer_cache, cache_max_tokens=cache_max_tokens)
+        if use_ckpt:
+            block = blocks[i]
+
+            def run_block(inp: Tensor, resid: Tensor, _block: nn.Module = block) -> Tensor:
+                out, _ = _block(inp, resid, kv_cache=None, cache_max_tokens=None)
+                return out
+
+            x = checkpoint(run_block, x, x0, use_reentrant=False)
+            layer_new_cache = None
+        else:
+            layer_cache = None if kv_cache_blocks is None else kv_cache_blocks[i]
+            x, layer_new_cache = blocks[i](x, x0, kv_cache=layer_cache, cache_max_tokens=cache_max_tokens)
         skips.append(x)
         if new_cache is not None:
             new_cache.append(layer_new_cache)
@@ -511,8 +534,18 @@ def run_unet_once(
         if skips and i < skip_weights.size(0):
             x = x + skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
         layer_idx = num_encoder_layers + i
-        layer_cache = None if kv_cache_blocks is None else kv_cache_blocks[layer_idx]
-        x, layer_new_cache = blocks[layer_idx](x, x0, kv_cache=layer_cache, cache_max_tokens=cache_max_tokens)
+        if use_ckpt:
+            block = blocks[layer_idx]
+
+            def run_block(inp: Tensor, resid: Tensor, _block: nn.Module = block) -> Tensor:
+                out, _ = _block(inp, resid, kv_cache=None, cache_max_tokens=None)
+                return out
+
+            x = checkpoint(run_block, x, x0, use_reentrant=False)
+            layer_new_cache = None
+        else:
+            layer_cache = None if kv_cache_blocks is None else kv_cache_blocks[layer_idx]
+            x, layer_new_cache = blocks[layer_idx](x, x0, kv_cache=layer_cache, cache_max_tokens=cache_max_tokens)
         if new_cache is not None:
             new_cache.append(layer_new_cache)
     return x, new_cache
@@ -551,6 +584,7 @@ class Phase2GPT(nn.Module):
         )
         self.loop_embeddings = nn.Parameter(torch.zeros(cfg.num_loops, cfg.model_dim, dtype=torch.float32))
         self.loop_gates = nn.Parameter(torch.ones(cfg.num_loops, dtype=torch.float32))
+        self.use_gradient_checkpointing = True
         self.final_norm = RMSNorm()
         self._init_weights()
 
@@ -575,6 +609,8 @@ class Phase2GPT(nn.Module):
         kv_cache: list[tuple[Tensor, Tensor] | None] | None = None,
         cache_max_tokens: int | None = None,
     ) -> tuple[Tensor, list[tuple[Tensor, Tensor] | None] | None]:
+        if self.training and (kv_cache is not None or cache_max_tokens is not None):
+            raise RuntimeError("Neural cache is evaluation-only and must not be used during training.")
         if kv_cache is not None and len(kv_cache) != self.total_effective_layers:
             raise ValueError(
                 f"kv_cache length {len(kv_cache)} does not match effective layers {self.total_effective_layers}"
@@ -606,6 +642,7 @@ class Phase2GPT(nn.Module):
                 self.skip_weights,
                 kv_cache_blocks=loop_cache,
                 cache_max_tokens=cache_max_tokens,
+                use_gradient_checkpointing=(self.use_gradient_checkpointing and self.training),
             )
             gate = self.loop_gates[loop_idx].to(dtype=x.dtype)
             x = loop_input + gate * (x - loop_input)
@@ -788,18 +825,27 @@ def eval_docs_neural_cache(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    *,
+    use_cache: bool,
+    debug_cache_stats: bool = False,
 ) -> tuple[float, float, int, int]:
     model.eval()
+    if model.training:
+        raise RuntimeError("Neural cache evaluation requires model.eval().")
+    cache_active = use_cache and cache_max_tokens > 0
     loss_sum = 0.0
     token_count = 0
     byte_count = 0.0
     windows = 0
+    debug_printed = False
     for doc in docs:
         if doc.numel() <= 1:
             continue
         x_doc = doc[:-1]
         y_doc = doc[1:]
-        layer_cache: list[tuple[Tensor, Tensor] | None] = [None for _ in range(model.total_effective_layers)]
+        layer_cache: list[tuple[Tensor, Tensor] | None] | None = (
+            [None for _ in range(model.total_effective_layers)] if cache_active else None
+        )
         for ws in range(0, x_doc.numel(), stride):
             end = min(ws + seq_len, x_doc.numel())
             wlen = end - ws
@@ -808,11 +854,32 @@ def eval_docs_neural_cache(
             x_win = x_doc[ws:end].to(device=device, dtype=torch.int64).unsqueeze(0)
             y_win = y_doc[ws:end].to(device=device, dtype=torch.int64).unsqueeze(0)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits, layer_cache = model.forward_logits(
-                    x_win,
-                    kv_cache=layer_cache,
-                    cache_max_tokens=cache_max_tokens,
-                )
+                if cache_active:
+                    logits, layer_cache = model.forward_logits(
+                        x_win,
+                        kv_cache=layer_cache,
+                        cache_max_tokens=cache_max_tokens,
+                    )
+                    if debug_cache_stats and not debug_printed and layer_cache is not None:
+                        for layer_state in layer_cache:
+                            if layer_state is None:
+                                continue
+                            cached_k = layer_state[0].to(torch.float32)
+                            k_mean = float(cached_k.mean().item())
+                            k_std = float(cached_k.std(unbiased=False).item())
+                            print(
+                                f"neural_cache_debug:first_cached_k mean={k_mean:.6e} std={k_std:.6e}",
+                                flush=True,
+                            )
+                            if abs(k_mean) < 1e-8 or k_std < 1e-8 or k_std > 1e3:
+                                print(
+                                    "neural_cache_debug:WARNING cached K stats look suspicious (near-zero or too large)",
+                                    flush=True,
+                                )
+                            debug_printed = True
+                            break
+                else:
+                    logits, _ = model.forward_logits(x_win, kv_cache=None, cache_max_tokens=None)
             score_start = 0 if ws == 0 else max(wlen - stride, 0)
             scored_logits = logits[:, score_start:, :].reshape(-1, logits.size(-1)).float()
             scored_targets = y_win[:, score_start:].reshape(-1)
@@ -826,6 +893,8 @@ def eval_docs_neural_cache(
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             byte_count += float(token_bytes.to(torch.float64).sum().item())
             windows += 1
+    if debug_cache_stats and cache_active and not debug_printed:
+        print("neural_cache_debug:WARNING no cached K tensor was observed.", flush=True)
     val_loss = loss_sum / float(token_count)
     return val_loss, compute_bpb(loss_sum, float(token_count), byte_count), windows, token_count
 
@@ -961,6 +1030,7 @@ def apply_swa_state(model: nn.Module, swa_state: dict[str, Tensor], swa_count: i
 
 def main() -> None:
     args = Hyperparameters()
+    NEURAL_CACHE_ENABLED = os.environ.get("NEURAL_CACHE_ENABLED", "0") == "1"
     root = Path(__file__).resolve().parent
     dataset_dir = resolve_path(root, args.data_path)
     tokenizer_path = resolve_path(root, args.tokenizer_path)
@@ -1017,16 +1087,26 @@ def main() -> None:
     val_docs = extract_first_validation_docs([Path(p) for p in val_files], bos_id=bos_id, num_docs=args.eval_docs)
     train_loader = SingleGpuTokenLoader(train_glob, device=device)
 
+    compile_backend = os.environ.get("TORCH_COMPILE_BACKEND", "inductor")
+    NO_COMPILE = os.environ.get("NO_COMPILE", "0") == "1"
+
     base_model = Phase2GPT(args).to(device)
     training_model: nn.Module = base_model
-    if args.compile_training:
+    if NO_COMPILE or not args.compile_training:
+        training_model = base_model
+        if NO_COMPILE:
+            print("compile_disabled:NO_COMPILE=1", flush=True)
+        else:
+            print("compile_disabled:COMPILE_TRAIN_MODEL=0", flush=True)
+    else:
         training_model = torch.compile(
             base_model,
             dynamic=False,
             fullgraph=False,
-            backend=args.compile_backend,
+            backend=compile_backend,
         )
-        print(f"compile_backend:{args.compile_backend}", flush=True)
+        print(f"compile_backend:{compile_backend}", flush=True)
+    print(f"neural_cache_enabled:{int(NEURAL_CACHE_ENABLED)}", flush=True)
 
     matrix_params, scalar_params = split_optimizer_parameters(base_model)
     optimizer_muon = Muon(
@@ -1185,17 +1265,58 @@ def main() -> None:
     neural_cache_model.load_state_dict(deq_state, strict=True)
     neural_cache_model.eval()
     torch.cuda.synchronize()
-    post_cache_val_loss, post_cache_val_bpb, cache_windows, cache_scored_tokens = eval_docs_neural_cache(
-        model=neural_cache_model,
-        docs=val_docs,
-        device=device,
-        seq_len=args.train_seq_len,
-        stride=args.eval_stride,
-        cache_max_tokens=args.cache_max_tokens,
-        base_bytes_lut=base_bytes_lut,
-        has_leading_space_lut=has_leading_space_lut,
-        is_boundary_token_lut=is_boundary_token_lut,
-    )
+    cache_sweep_sizes = (0, 256, 1024)
+    cache_sweep: dict[str, dict[str, float | int]] = {}
+    for cache_size in cache_sweep_sizes:
+        sweep_use_cache = NEURAL_CACHE_ENABLED and cache_size > 0
+        sweep_cache_max = cache_size if sweep_use_cache else 0
+        sweep_loss, sweep_bpb, sweep_windows, sweep_tokens = eval_docs_neural_cache(
+            model=neural_cache_model,
+            docs=val_docs,
+            device=device,
+            seq_len=args.train_seq_len,
+            stride=args.eval_stride,
+            cache_max_tokens=sweep_cache_max,
+            base_bytes_lut=base_bytes_lut,
+            has_leading_space_lut=has_leading_space_lut,
+            is_boundary_token_lut=is_boundary_token_lut,
+            use_cache=sweep_use_cache,
+            debug_cache_stats=(cache_size == 256 and sweep_use_cache),
+        )
+        cache_sweep[str(cache_size)] = {
+            "use_cache": int(sweep_use_cache),
+            "effective_cache_max_tokens": int(sweep_cache_max),
+            "val_loss": sweep_loss,
+            "val_bpb": sweep_bpb,
+            "windows": sweep_windows,
+            "scored_tokens": sweep_tokens,
+        }
+        print(
+            f"neural_cache_sweep cache_size={cache_size} effective_cache={sweep_cache_max} val_bpb:{sweep_bpb:.6f}",
+            flush=True,
+        )
+
+    effective_post_cache_size = args.cache_max_tokens if NEURAL_CACHE_ENABLED else 0
+    effective_post_use_cache = NEURAL_CACHE_ENABLED and effective_post_cache_size > 0
+    if str(effective_post_cache_size) in cache_sweep:
+        post_cache_val_loss = float(cache_sweep[str(effective_post_cache_size)]["val_loss"])
+        post_cache_val_bpb = float(cache_sweep[str(effective_post_cache_size)]["val_bpb"])
+        cache_windows = int(cache_sweep[str(effective_post_cache_size)]["windows"])
+        cache_scored_tokens = int(cache_sweep[str(effective_post_cache_size)]["scored_tokens"])
+    else:
+        post_cache_val_loss, post_cache_val_bpb, cache_windows, cache_scored_tokens = eval_docs_neural_cache(
+            model=neural_cache_model,
+            docs=val_docs,
+            device=device,
+            seq_len=args.train_seq_len,
+            stride=args.eval_stride,
+            cache_max_tokens=effective_post_cache_size,
+            base_bytes_lut=base_bytes_lut,
+            has_leading_space_lut=has_leading_space_lut,
+            is_boundary_token_lut=is_boundary_token_lut,
+            use_cache=effective_post_use_cache,
+            debug_cache_stats=effective_post_use_cache,
+        )
 
     print(f"val_bpb pre-quant: {pre_quant_val_bpb:.6f}", flush=True)
     print(f"val_bpb post-quant: {post_quant_val_bpb:.6f}", flush=True)
@@ -1212,6 +1333,7 @@ def main() -> None:
             "tokenizer_path": str(tokenizer_path),
             "results_path": str(results_path),
             "artifact_path": str(artifact_path),
+            "neural_cache_enabled": NEURAL_CACHE_ENABLED,
         },
         "schedule": {
             "iterations_target": args.iterations,
@@ -1254,7 +1376,10 @@ def main() -> None:
                 "val_bpb": post_cache_val_bpb,
                 "windows": cache_windows,
                 "scored_tokens": cache_scored_tokens,
+                "effective_cache_max_tokens": effective_post_cache_size,
+                "use_cache": int(effective_post_use_cache),
             },
+            "neural_cache_sweep": cache_sweep,
             "artifact_size_bytes": artifact_size_bytes,
         },
     }
